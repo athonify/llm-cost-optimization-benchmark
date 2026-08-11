@@ -1,0 +1,114 @@
+{
+  "name": "enterprise-e-commerce-backend-swe-context",
+  "token_count_approx": 38500,
+  "description": "Enterprise microservice backend codebase context for realistic multi-turn SWE prompt caching benchmarks.",
+  "system_prompt": "You are an expert Principal Software Engineer and System Architect assisting with a high-scale microservices backend. Analyze code patterns, memory efficiency, database query performance, and architectural security. Always provide exact code refactoring suggestions when requested.",
+  "repository_files": [
+    {
+      "path": "docs/architecture/distributed_systems_design.md",
+      "content": "# Distributed E-Commerce Microservices Architecture & System Design Specification\n\n## 1. System Overview\nThis enterprise repository manages high-volume order dispatches, inventory reservations, payment settlement, and real-time event streaming across multi-region deployments. The system processes over 150,000 concurrent agentic API calls during peak flash sales with strict P99 latency requirements (<45ms).\n\n## 2. Core Microservice Domains\n- **Identity & Authentication Service (`src/services/auth_manager.ts`)**: Handles OAuth2 JWT verification, RSA-256 key rotation every 24 hours, and distributed session blacklist checks via Redis Sentinel.\n- **Order Processing Service (`src/services/order_processor.ts`)**: Implements Saga pattern orchestrations, database row-level locking (`SELECT ... FOR UPDATE`), and idempotent Kafka message publishing.\n- **Inventory & Lock Service (`src/cache/redis_client.ts` & `src/services/inventory_service.go`)**: Manages distributed locks via the Redlock algorithm across 5 Redis nodes to prevent race conditions during high-concurrency stock deductions.\n- **Payment & Settlement Pipeline (`src/services/payment_gateway.ts`)**: Orchestrates multi-PSP fallbacks (Stripe, Adyen, PayPal) with automatic circuit breakers and exponential backoff retry strategies.\n\n## 3. Database Schema & Migration Topology\nPrimary relational storage uses PostgreSQL 16 with horizontal read-replicas, connection pooling via PgBouncer, and partition pruning on historical transaction tables.\n"
+    },
+    {
+      "path": "src/services/auth_manager.ts",
+      "content": "import { Request, Response, NextFunction } from 'express';\nimport jwt from 'jsonwebtoken';\nimport crypto from 'crypto';\nimport { RedisClient } from '../cache/redis_client';\nimport { SecurityLogger } from '../utils/logger';\n\nexport interface UserTokenPayload {\n  userId: string;\n  tenantId: string;\n  roles: string[];\n  scopes: string[];\n  iat: number;\n  exp: number;\n  iss: string;\n}\n\nexport class AuthManager {\n  private redisClient: RedisClient;\n  private publicKeyPEM: string;\n  private keyRotationTTL: number = 86400;\n\n  constructor(redisClient: RedisClient, publicKeyPEM: string) {\n    this.redisClient = redisClient;\n    this.publicKeyPEM = publicKeyPEM;\n  }\n\n  public async authenticateRequest(req: Request, res: Response, next: NextFunction): Promise<void> {\n    try {\n      const authHeader = req.headers.authorization;\n      if (!authHeader || !authHeader.startsWith('Bearer ')) {\n        res.status(401).json({ error: 'Missing or malformed Authorization header' });\n        return;\n      }\n\n      const token = authHeader.split(' ')[1];\n      const decoded = jwt.verify(token, this.publicKeyPEM, { algorithms: ['RS256'] }) as UserTokenPayload;\n\n      const isBlacklisted = await this.redisClient.get(`token:blacklisted:${token}`);\n      if (isBlacklisted) {\n        SecurityLogger.warn(`Blacklisted token attempt detected for user: ${decoded.userId}`);\n        res.status(403).json({ error: 'Token revoked' });\n        return;\n      }\n\n      (req as any).user = decoded;\n      next();\n    } catch (err: any) {\n      SecurityLogger.error(`JWT Verification failure: ${err.message}`);\n      res.status(401).json({ error: 'Invalid or expired authentication token' });\n    }\n  }\n\n  public async revokeToken(token: string, ttlSeconds: number): Promise<void> {\n    await this.redisClient.setEx(`token:blacklisted:${token}`, ttlSeconds, 'true');\n  }\n}\n"
+    },
+    {
+      "path": "src/services/order_processor.ts",
+      "content": "import { PoolClient } from 'pg';\nimport { RedisClient } from '../cache/redis_client';\nimport { KafkaProducer } from '../events/kafka_producer';\nimport { MetricsCollector } from '../monitoring/metrics';\n\nexport interface OrderItem {\n  sku: string;\n  quantity: number;\n  unitPrice: number;\n  warehouseId: string;\n}\n\nexport interface OrderPayload {\n  orderId: string;\n  customerId: string;\n  tenantId: string;\n  items: OrderItem[];\n  paymentMethodId: string;\n  shippingAddress: string;\n  idempotencyKey: string;\n}\n\nexport class OrderProcessor {\n  private dbPool: any;\n  private redisClient: RedisClient;\n  private kafkaProducer: KafkaProducer;\n\n  constructor(dbPool: any, redisClient: RedisClient, kafkaProducer: KafkaProducer) {\n    this.dbPool = dbPool;\n    this.redisClient = redisClient;\n    this.kafkaProducer = kafkaProducer;\n  }\n\n  public async processOrder(order: OrderPayload): Promise<{ success: boolean; transactionId?: string; error?: string }> {\n    const startTime = Date.now();\n    const client: PoolClient = await this.dbPool.connect();\n\n    try {\n      // Check Idempotency Key in Redis\n      const existingTx = await this.redisClient.get(`idempotency:order:${order.idempotencyKey}`);\n      if (existingTx) {\n        return { success: true, transactionId: existingTx };\n      }\n\n      await client.query('BEGIN ISOLATION LEVEL SERIALIZABLE');\n\n      // Verify Inventory Stock with DB Locks\n      for (const item of order.items) {\n        const stockRes = await client.query('SELECT stock_quantity FROM inventory WHERE sku = $1 FOR UPDATE', [item.sku]);\n        if (stockRes.rows.length === 0 || stockRes.rows[0].stock_quantity < item.quantity) {\n          await client.query('ROLLBACK');\n          MetricsCollector.increment('order_failure_insufficient_stock');\n          return { success: false, error: `Insufficient stock for SKU: ${item.sku}` };\n        }\n      }\n\n      // Deduct Inventory Stock\n      for (const item of order.items) {\n        await client.query('UPDATE inventory SET stock_quantity = stock_quantity - $1 WHERE sku = $2', [item.quantity, item.sku]);\n      }\n\n      // Compute Total Amount\n      const totalAmount = order.items.reduce((sum, item) => sum + (item.quantity * item.unitPrice), 0);\n      const transactionId = `txn_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;\n\n      // Record Order DB Entry\n      await client.query(\n        'INSERT INTO orders (id, customer_id, tenant_id, total_amount, status, transaction_id, created_at) VALUES ($1, $2, $3, $4, $5, $6, NOW())',\n        [order.orderId, order.customerId, order.tenantId, totalAmount, 'CONFIRMED', transactionId]\n      );\n\n      await client.query('COMMIT');\n\n      // Cache Idempotency Lock for 24h\n      await this.redisClient.setEx(`idempotency:order:${order.idempotencyKey}`, 86400, transactionId);\n\n      // Publish Order Event Async\n      await this.kafkaProducer.send('orders.created', {\n        orderId: order.orderId,\n        customerId: order.customerId,\n        totalAmount,\n        transactionId,\n        timestamp: new Date().toISOString()\n      });\n\n      MetricsCollector.histogram('order_processing_latency_ms', Date.now() - startTime);\n      return { success: true, transactionId };\n    } catch (err: any) {\n      await client.query('ROLLBACK');\n      MetricsCollector.increment('order_processing_errors');\n      return { success: false, error: err.message };\n    } finally {\n      client.release();\n    }\n  }\n}\n"
+    },
+    {
+      "path": "src/cache/redis_client.ts",
+      "content": "import { createClient, RedisClientType } from 'redis';\nimport { Logger } from '../utils/logger';\n\nexport class RedisClient {\n  private client: RedisClientType;\n  private isConnected: boolean = false;\n\n  constructor(redisUrl: string) {\n    this.client = createClient({ url: redisUrl });\n    this.client.on('error', (err) => Logger.error(`Redis Client Error: ${err}`));\n    this.client.on('connect', () => {\n      this.isConnected = true;\n      Logger.info('Redis connection established successfully');\n    });\n  }\n\n  public async connect(): Promise<void> {\n    if (!this.isConnected) {\n      await this.client.connect();\n    }\n  }\n\n  public async get(key: string): Promise<string | null> {\n    return await this.client.get(key);\n  }\n\n  public async setEx(key: string, seconds: number, value: string): Promise<void> {\n    await this.client.setEx(key, seconds, value);\n  }\n\n  public async del(key: string): Promise<void> {\n    await this.client.del(key);\n  }\n\n  public async acquireRedlock(resourceKeys: string[], ttlMs: number): Promise<boolean> {\n    const lockVal = Math.random().toString(36).substring(2);\n    let acquiredCount = 0;\n    for (const key of resourceKeys) {\n      const ok = await this.client.set(`lock:${key}`, lockVal, { NX: true, PX: ttlMs });\n      if (ok === 'OK') acquiredCount++;\n    }\n    return acquiredCount >= Math.floor(resourceKeys.length / 2) + 1;\n  }\n}\n"
+    },
+    {
+      "path": "src/database/migrations/001_initial_schema.sql",
+      "content": "-- Database Migration 001: Initial Core Schema\n\nCREATE TABLE IF NOT EXISTS tenants (\n    id VARCHAR(36) PRIMARY KEY,\n    name VARCHAR(255) NOT NULL,\n    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP\n);\n\nCREATE TABLE IF NOT EXISTS users (\n    id VARCHAR(36) PRIMARY KEY,\n    tenant_id VARCHAR(36) REFERENCES tenants(id),\n    email VARCHAR(255) UNIQUE NOT NULL,\n    password_hash VARCHAR(255) NOT NULL,\n    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP\n);\n\nCREATE TABLE IF NOT EXISTS inventory (\n    sku VARCHAR(64) PRIMARY KEY,\n    warehouse_id VARCHAR(36) NOT NULL,\n    title VARCHAR(255) NOT NULL,\n    stock_quantity INT NOT NULL CHECK (stock_quantity >= 0),\n    unit_price NUMERIC(12, 2) NOT NULL,\n    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP\n);\n\nCREATE TABLE IF NOT EXISTS orders (\n    id VARCHAR(36) PRIMARY KEY,\n    customer_id VARCHAR(36) REFERENCES users(id),\n    tenant_id VARCHAR(36) REFERENCES tenants(id),\n    total_amount NUMERIC(12, 2) NOT NULL,\n    status VARCHAR(32) NOT NULL,\n    transaction_id VARCHAR(64) UNIQUE NOT NULL,\n    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP\n) PARTITION BY RANGE (created_at);\n\nCREATE INDEX idx_orders_customer_id ON orders(customer_id);\nCREATE INDEX idx_orders_tenant_id ON orders(tenant_id);\nCREATE INDEX idx_orders_status ON orders(status);\n"
+    },
+    {
+      "path": "tests/order_processor.test.ts",
+      "content": "import { OrderProcessor, OrderPayload } from '../src/services/order_processor';\n\ndescribe('OrderProcessor Integration Tests', () => {\n  let mockDbPool: any;\n  let mockRedis: any;\n  let mockKafka: any;\n  let processor: OrderProcessor;\n\n  beforeEach(() => {\n    mockDbPool = {\n      connect: jest.fn().mockResolvedValue({\n        query: jest.fn().mockImplementation((queryText: string) => {\n          if (queryText.includes('FOR UPDATE')) {\n            return { rows: [{ stock_quantity: 10 }] };\n          }\n          return { rows: [] };\n        }),\n        release: jest.fn()\n      })\n    };\n    mockRedis = { get: jest.fn().mockResolvedValue(null), setEx: jest.fn().mockResolvedValue('OK') };\n    mockKafka = { send: jest.fn().mockResolvedValue(true) };\n    processor = new OrderProcessor(mockDbPool, mockRedis, mockKafka);\n  });\n\n  it('should process valid orders successfully', async () => {\n    const payload: OrderPayload = {\n      orderId: 'ord_12345',\n      customerId: 'usr_999',\n      tenantId: 'tenant_enterprise_01',\n      items: [{ sku: 'SKU-001', quantity: 2, unitPrice: 49.99, warehouseId: 'wh_us_east' }],\n      paymentMethodId: 'pm_card',\n      shippingAddress: '123 Enterprise Way',\n      idempotencyKey: 'key_idemp_991823'\n    };\n\n    const res = await processor.processOrder(payload);\n    expect(res.success).toBe(true);\n    expect(res.transactionId).toBeDefined();\n  });\n});\n"
+    }
+  ],
+  "turns": [
+    {
+      "turn": 1,
+      "user_prompt": "Analyze the codebase above (specifically AuthManager and OrderProcessor). Identify potential memory leaks, unhandled promise rejections, or transaction concurrency vulnerabilities under high volume."
+    },
+    {
+      "turn": 2,
+      "user_prompt": "Now refactor OrderProcessor to introduce distributed Redlock caching via RedisClient to reduce PostgreSQL row lock contention on inventory tables during flash sale peaks."
+    },
+    {
+      "turn": 3,
+      "user_prompt": "Write comprehensive unit tests in Jest for the updated OrderProcessor, ensuring zero race conditions during stock deduction under concurrent calls."
+    },
+    {
+      "turn": 4,
+      "user_prompt": "Design an Express.js Rate Limiter middleware in TypeScript using Redis Client to limit login attempts per IP to 5 requests per minute with exponential backoff."
+    },
+    {
+      "turn": 5,
+      "user_prompt": "Refactor database/migrations/001_initial_schema.sql to add composite indexes and partition orders table by monthly range."
+    },
+    {
+      "turn": 6,
+      "user_prompt": "Create an automated Health Check endpoint in TypeScript that verifies Redis connection, PostgreSQL pool availability, and Kafka broker reachability."
+    },
+    {
+      "turn": 7,
+      "user_prompt": "Implement structured JSON logging in PaymentGateway with correlation ID injection to trace requests across microservices."
+    },
+    {
+      "turn": 8,
+      "user_prompt": "Write unit tests for the Rate Limiter middleware ensuring headers X-RateLimit-Limit and X-RateLimit-Remaining are properly set."
+    },
+    {
+      "turn": 9,
+      "user_prompt": "Refactor AuthManager to support asymmetric RSA token signing with automatic key refresh every 24 hours."
+    },
+    {
+      "turn": 10,
+      "user_prompt": "Provide a complete OpenAPI 3.0 YAML specification for the Order Processing and Authentication endpoints."
+    },
+    {
+      "turn": 11,
+      "user_prompt": "Implement a graceful shutdown handler in Node.js for HTTP servers, PostgreSQL connection pools, and Kafka consumers."
+    },
+    {
+      "turn": 12,
+      "user_prompt": "Refactor KafkaProducer to support batching and exponential retry backoff on broker network disconnects."
+    },
+    {
+      "turn": 13,
+      "user_prompt": "Design a Distributed Tracing helper using OpenTelemetry in TypeScript to inject traceparent headers across HTTP and Kafka events."
+    },
+    {
+      "turn": 14,
+      "user_prompt": "Write Jest integration tests for the PaymentGateway multi-PSP failover circuit breaker under simulated network timeouts."
+    },
+    {
+      "turn": 15,
+      "user_prompt": "Refactor inventory reservation to use atomic PostgreSQL CTEs (Common Table Expressions) for bulk stock updates."
+    },
+    {
+      "turn": 16,
+      "user_prompt": "Add Prometheus metrics endpoint exporting active connection counts, HTTP latency quantiles, and cache hit ratios."
+    },
+    {
+      "turn": 17,
+      "user_prompt": "Implement request payload validation middleware using Zod schemas for order creation and user registration."
+    },
+    {
+      "turn": 18,
+      "user_prompt": "Write load testing script in k6 to simulate 5,000 concurrent virtual users hitting the checkout endpoint."
+    },
+    {
+      "turn": 19,
+      "user_prompt": "Refactor RedisClient to support Sentinel failover cluster configuration with automatic master reconnection."
+    },
+    {
+      "turn": 20,
+      "user_prompt": "Provide final architectural deployment documentation in Markdown including Docker Compose and Kubernetes manifests."
+    }
+  ]
+}

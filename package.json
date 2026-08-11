@@ -1,0 +1,28 @@
+{
+  "name": "athonify-llm-cost-optimization-benchmark",
+  "version": "1.0.0",
+  "description": "Official open-source benchmark suite for auditability and transparency of Athonify LLM Cost Optimization",
+  "main": "scripts/run-benchmark.js",
+  "type": "module",
+  "scripts": {
+    "benchmark": "node scripts/run-benchmark.js"
+  },
+  "keywords": [
+    "athonify",
+    "llm",
+    "cost-optimization",
+    "prompt-caching",
+    "asymmetric-routing",
+    "benchmark",
+    "claude-sonnet-5"
+  ],
+  "author": "Athonify Team",
+  "license": "MIT",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "chalk": "^5.3.0",
+    "cli-table3": "^0.6.5",
+    "dotenv": "^16.4.7",
+    "openai": "^4.85.4"
+  }
+}
